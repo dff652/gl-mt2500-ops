@@ -673,6 +673,169 @@ gl-mt2500-3 → 公网 → Nuremberg DERP (德国) → 公网 → istoreos
 
 ---
 
+## 第二轮排查：自动化诊断实验（2026-04-12 晚）
+
+### 背景
+
+针对 P0 问题"DERP 901 外部 TLS 不通"，设计了自动化对照实验脚本，在 bj-ali-hb2（服务端）和 gl-mt2500-3（客户端）上交互执行。
+
+### Anti-DDoS 排除验证
+
+**阿里云控制台确认：**
+
+| 项目 | 值 |
+|------|------|
+| 实例 ID | facae0627cb94c3d8527a4dd3a573ecc |
+| 状态 | 正常 |
+| 防护类型 | DDoS 基础防护 |
+| 清洗阈值 | bps 200M / pps 200K |
+| 清洗/黑洞事件 | **无** |
+
+**tcpdump 抓包验证（排除 Anti-DDoS 前）：**
+
+```bash
+# bj-ali-hb2（443 端口未监听状态）
+root@iZ2ze529wb7v0j0o3lfdu4Z:~# tcpdump -i eth0 -nn 'host 124.64.222.148 and port 443' -c 20
+
+# 结果：SYN 包到达服务器，服务器回 RST（端口无服务）
+124.64.222.148.41560 > 172.25.0.148.443: Flags [S]       ← SYN 到达
+172.25.0.148.443 > 124.64.222.148.41560: Flags [R.]      ← 服务器自己回 RST
+
+# gl-mt2500-3 对应的报错
+curl: (7) Failed to connect to derp.wcdz.tech port 443: Connection refused
+```
+
+**结论：Anti-DDoS 从未被触发，SYN 包完整到达服务器。原"Anti-DDoS 阻断 TLS"结论被推翻。**
+
+### 实验设计（6 组对照实验）
+
+| # | 服务端 443 | 服务端 8080 | 控制变量 | 验证目标 |
+|---|------------|------------|----------|----------|
+| 1 | nc（纯 TCP） | - | TCP 基线 | 端口连通性 |
+| 2 | openssl s_server | - | TLS 基线 | 最简 TLS 能否握手 |
+| 3 | derper (Go TLS) | - | 核心问题 | Go TLS 是否被干扰 |
+| 4 | openssl s_server | derper (HTTP) | 进程隔离 | derper 后台运行是否干扰别的 TLS |
+| 5 | socat → 8080 | derper (HTTP) | 方案验证 | socat TLS 终结能否端到端工作 |
+| 6 | nc 12345（纯 TCP） | derper (HTTP) | 交叉验证 | derper 存在时 TCP 是否正常 |
+
+脚本位于 `scripts/derp-diag-server.sh`（服务端）和 `scripts/derp-diag-client.sh`（客户端）。
+
+### 第一轮执行结果（v1 脚本，有 bug）
+
+**脚本缺陷导致实验结果全部作废：**
+
+`nc` 使用 `while true; do nc -l -p 443; done &` 循环，实验间清理时只杀了子进程但循环立即重生，导致 nc 僵尸进程始终霸占 443 端口。
+
+服务端日志证据：
+
+```
+# 实验 2 端口状态（应只有 openssl，实际 nc 还在）
+LISTEN 0  1  0.0.0.0:443  users:(("nc",pid=50640,fd=3))   ← nc 僵尸
+LISTEN 0  1  0.0.0.0:443  users:(("nc",pid=50617,fd=3))   ← nc 僵尸
+
+# 实验 3 derper 启动失败
+derper: listen tcp :443: bind: address already in use
+Exited (1) 5 seconds ago
+```
+
+6 个实验实际全在测 nc 回的纯文本 `DERP_DIAG_TCP_OK_EXP1\n`（22 字节），curl 收到非 TLS 数据后报错：
+- 用 IP 连接：`ssl3_get_record:wrong version number`（收到纯文本而非 TLS）
+- 用域名连接：`Connection reset by peer`
+
+**客户端脚本额外 bug：** busybox nc 不支持 `-w` 参数，导致实验 1/6 的 TCP 测试直接失败；`logrun` 通过 pipe 到 tee 丢失了 curl 真实退出码（始终返回 0）。
+
+### 第一轮有效成果
+
+虽然对照实验作废，但 pcap 和控制台数据提供了三个确定性结论：
+
+| 结论 | 证据 | 状态 |
+|------|------|------|
+| **Anti-DDoS 不是原因** | 控制台无清洗事件；阈值 200Mbps 远超实际流量；pcap 中 SYN 到达服务器 | **确认** |
+| **网络链路完全正常** | pcap 显示 TCP 三次握手成功，nc 的 22 字节被客户端收到，数据双向传输正常；ping RTT 8ms | **确认** |
+| **IPv6 两端不可用** | 家庭：OpenClash 关闭了 IPv6，无全局地址；公司：仅 Tailscale ULA 地址 `fd7a:` | **确认** |
+
+### 第一轮新发现的状态变化
+
+| 项目 | 原文档记录 | 实际最新状态 |
+|------|-----------|-------------|
+| Let's Encrypt 证书 | 2026-03-24 ~ 2026-06-22 | **已自动续期**: 2026-04-12 ~ 2026-07-11 |
+| Nearest DERP | Nuremberg (nue) ~470ms | San Francisco (sfo) 348ms（最近官方节点有变化） |
+| bj-ali-hb2 额外服务 | - | 发现 `kspeeder` 进程监听 5443/5003 端口 |
+
+### 第一轮需修正的原有结论
+
+以下原文档中的已验证/已排除项需要重新评估：
+
+- [x] ~~**OpenClash 不是原因**~~：原测试仅用 `ip rule` 绕过路由，但 OpenClash TUN 模式通过 iptables MARK 劫持流量，`ip rule` 可能不够。**待第二轮验证。**
+- [x] ~~**derper 进程相关性**~~：原观察（derper 在运行时其他 TLS 也不通）可能是 nc 僵尸进程的干扰，而非 derper 真的影响了其他服务。**待第二轮验证。**
+
+### v2 脚本修复
+
+1. nc 改为单次执行（不用 while 循环），杀即死
+2. 新增 `nuke_port()` 函数：`fuser -k -9` + ss PID 提取 + pkill 三重清理
+3. 每个实验前 `assert_port_free` 断言端口为空，启动后 `assert_port_held_by` 验证正确进程监听
+4. 客户端 nc 兼容 busybox（去掉 `-w` 参数）
+5. 客户端 curl 退出码改用 `$()` 捕获（不再经过 tee pipe）
+
+### 第二轮待执行
+
+**核心问题：derper Go TLS 从外部到底能不能连？（上一轮因端口冲突未得到答案）**
+
+实验计划不变（6 组对照），使用 v2 脚本。如果实验 2 通、实验 3 不通，增加 OpenClash 排除测试：
+
+```bash
+# gl-mt2500-3 临时关闭 OpenClash
+/etc/init.d/openclash stop
+curl -vk --connect-timeout 5 https://39.102.98.79:443
+curl -vk --connect-timeout 5 https://derp.wcdz.tech:443
+/etc/init.d/openclash start
+```
+
+---
+
+## 问题清单（更新）
+
+### 已解决
+
+- [x] **10.8.0.5 身份确认**：是 istoreos 自身的 OpenVPN 客户端
+- [x] **istoreos OpenVPN 清理**：两个 OpenVPN 服务均已 disabled
+- [x] **Tailscale tunnel-in-tunnel 消除**：已切换到 DERP 中继
+- [x] **Bitbucket 7990 访问**：通过策略路由 + MASQUERADE 解决
+- [x] **OpenVPN push route 缺失**：已添加
+- [x] **rc.local exit 0 顺序问题**：已修复
+- [x] **Anti-DDoS 排除**：控制台确认状态正常，pcap 证实 SYN 到达服务器（第二轮新增）
+
+### 已验证/已排除
+
+- [x] **DERP 证书有效**：Let's Encrypt E7，已自动续期至 2026-07-11
+- [x] **iptables 无干扰**：derper 启停前后 iptables 仅时间戳差异
+- [x] **STUN (UDP 3478) 正常**：netcheck 显示正常
+- [x] **网络链路正常**：pcap 证实 TCP 三次握手成功、数据双向传输（ping 8ms）
+- [x] **IPv6 不可用**：家庭无全局 IPv6（OpenClash 关闭），公司仅 Tailscale ULA
+
+### 需重新验证（原结论可能有误）
+
+- [ ] **OpenClash 是否干扰 TLS**：原测试用 `ip rule` 绕过不够充分，TUN 模式通过 iptables 劫持。需关闭 OpenClash 后重测
+- [ ] **derper 进程是否干扰同机 TLS**：原观察可能被 nc 僵尸进程污染。需第二轮干净实验验证
+- [ ] **Go TLS vs OpenSSL**：原结论"openssl 通、derper 不通"需在端口干净的条件下重新验证
+
+### 未解决 — 按优先级排序
+
+**P0（阻塞最终目标）**：
+- [ ] **DERP 901 外部 TLS 不通**：根因待定（Anti-DDoS 已排除，可能是 OpenClash 劫持或 Go TLS 被 DPI 干扰）。当前家庭 ↔ 公司走海外 DERP 延迟 ~348-468ms，远超目标 < 20ms。
+
+**P1（影响稳定性/安全性）**：
+- [ ] **OpenVPN 客户端证书泄露**：istoreos 的私钥和 TLS 密钥在终端输出，需��新生成
+- [ ] **Let's Encrypt 证书续期机制**：证书已续期（~2026-07-11），但 derper 不在 443 端口运行时 autocert 续期路径需确认
+
+**P2（技术债务）**：
+- [ ] **server.ovpn server 行格式异常**：`server  255.255.255.0` 缺少网段地址
+- [ ] **firewall.user 规则幂等化**
+- [ ] **bj-ali-hb2 残留服务清理**：derper + socat + nginx + kspeeder (5443/5003)
+- [ ] **bj-ali-hb2 安全扫描暴露面大**：pcap 显示大量外部 IP（5.x/23.x/45.x）扫描 443 端口
+
+---
+
 ## 安全提醒
 
 排查过程中 istoreos 的 OpenVPN 客户端配置（含私钥和 TLS 密钥）被输出到终端。建议在 gl-mt2500-3 上**重新生成 OpenVPN 客户端证书**：
