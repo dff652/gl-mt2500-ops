@@ -898,9 +898,85 @@ tailscale ping gl-mt2500-3            # 期望: via DERP(ali-bj-hb2) in <20ms
 
 **最终目标验收：** `tailscale ping istoreos` 延迟从 ~468ms 降至 <20ms。
 
+### 第二轮执行结果（v2/v3 脚本）
+
+#### 6 组对照实验（端口状态验证通过）
+
+服务端每个实验前均确认 `[ OK ] 端口 443 已清空`，实验 3 derper 成功启动（无 `address already in use`）。
+
+| # | 场景 | IP (39.102.98.79) | 域名 (derp.wcdz.tech) |
+|---|------|---|---|
+| 1 | 纯 TCP nc | Connection refused (时序) | - |
+| 2 | openssl s_server | **TLS 1.3 成功** | **reset by peer** |
+| 3 | derper Go TLS 443 | **tlsv1 alert internal error** | **reset by peer** |
+| 4 | openssl 443 + derper 8080 | **tlsv1 alert internal error** | - |
+| 5 | socat 443 → derper 8080 | **TLS 1.3 成功** (DERP HTML) | **reset by peer** |
+| 6 | TCP 12345 + derper 8080 | Connection refused (时序) | - |
+
+关键发现：
+- 用 **IP** 连接 openssl/socat 均成功，说明网络链路和 TLS 本身没问题
+- 用**域名**连接任何服务均 reset，说明域名/SNI 被拦截
+- derper 的 Go TLS 即使用 IP 也报 `internal error`（独立问题，证书相关）
+- socat TLS 终结方案可行（实验 5 IP 成功，返回 DERP HTML 页面）
+
+#### socat verify=0 修复
+
+初始 socat 命令缺少 `verify=0` 参数，导致要求客户端证书：
+```
+socat E SSL_accept(): peer did not return a certificate
+curl: (56) tlsv13 alert certificate required
+```
+添加 `verify=0` 后修复，IP 连接返回 DERP 页面。
+
+#### OpenClash 排除
+
+OpenClash init 脚本状态与实际进程不同步（进程在跑但 `/etc/init.d/openclash stop` 报 `Already Stop!`），通过直接杀进程排除：
+
+```bash
+kill $(pgrep -f openclash_watchdog)  # 先杀 watchdog
+killall clash                         # 再杀 clash
+ps | grep -i clash | grep -v grep    # 确认无进程
+curl -vk https://derp.wcdz.tech:443  # 仍然 reset
+```
+
+**结论：OpenClash 不是根因。** clash 进程彻底死亡后域名连接仍被 reset。
+
+#### SNI DPI 定位
+
+逐步缩小范围的关键测试：
+
+| 测试 | 结果 | 排除了什么 |
+|------|------|-----------|
+| IP 直连 39.102.98.79 | ✅ 成功 | 排除服务端/网络层 |
+| 域名 derp.wcdz.tech | ❌ reset | 域名相关 |
+| 假域名 test.example.com → 同 IP (`--resolve`) | ✅ 成功 | 排除"所有域名被拦" |
+| 杀掉 clash 后域名 | ❌ reset | 排除 OpenClash |
+| `--resolve derp.wcdz.tech:443:39.102.98.79` | ❌ reset | 排除 DNS 劫持 |
+
+**最终结论：链路中存在 DPI 设备（ISP 或家庭主路由），检查 TLS ClientHello 中的 SNI 字段，匹配到 `derp.wcdz.tech`（含 VPN 中继特征关键词 `derp`）后注入 TCP RST。**
+
+证据链：
+1. `--resolve` 绕过 DNS 仍 reset → 不是 DNS 问题
+2. 同 IP 换 SNI（test.example.com）→ 成功 → 不是 IP 被封
+3. 杀掉 clash → 仍 reset → 不是本机代理
+4. 服务端 pcap 显示 SYN 到达 → 不是出站被拦
+5. 唯一变量：TLS ClientHello 中的 SNI 值
+
+#### 解决方案：换域名
+
+不含 `derp`/`vpn`/`proxy`/`tunnel` 等 VPN 特征关键词的新域名即可绕过 DPI。
+
+步骤：
+1. 新建 DNS A 记录：`<新域名>` → `39.102.98.79`
+2. bj-ali-hb2 上为新域名获取 Let's Encrypt 证书
+3. 更新 socat 证书路径 + derper DERP_DOMAIN
+4. 更新 Tailscale ACL derpMap 的 HostName
+5. 验证：`curl -vk https://<新域名>:443` 从 gl-mt2500-3 成功
+6. 恢复 DERPPort，验证 `tailscale ping istoreos` < 20ms
+
 ---
 
-## 问题清单（更新）
+## 问题清单（最终更新 2026-04-12）
 
 ### 已解决
 
@@ -910,7 +986,9 @@ tailscale ping gl-mt2500-3            # 期望: via DERP(ali-bj-hb2) in <20ms
 - [x] **Bitbucket 7990 访问**：通过策略路由 + MASQUERADE 解决
 - [x] **OpenVPN push route 缺失**：已添加
 - [x] **rc.local exit 0 顺序问题**：已修复
-- [x] **Anti-DDoS 排除**：控制台确认状态正常，pcap 证实 SYN 到达服务器（第二轮新增）
+- [x] **Anti-DDoS 排除**：控制台确认状态正常，pcap 证实 SYN 到达服务器
+- [x] **OpenClash 排除**：杀进程后域名仍 reset，不是 OpenClash
+- [x] **DERP 901 TLS 不通根因定位**：ISP/路由器 DPI 基于 SNI `derp.wcdz.tech` 注入 RST
 
 ### 已验证/已排除
 
@@ -919,27 +997,26 @@ tailscale ping gl-mt2500-3            # 期望: via DERP(ali-bj-hb2) in <20ms
 - [x] **STUN (UDP 3478) 正常**：netcheck 显示正常
 - [x] **网络链路正常**：pcap 证实 TCP 三次握手成功、数据双向传输（ping 8ms）
 - [x] **IPv6 不可用**：家庭无全局 IPv6（OpenClash 关闭），公司仅 Tailscale ULA
-
-### 需重新验证（原结论可能有误）
-
-- [ ] **OpenClash 是否干扰 TLS**：原测试用 `ip rule` 绕过不够充分，TUN 模式通过 iptables 劫持。需关闭 OpenClash 后重测
-- [ ] **derper 进程是否干扰同机 TLS**：原观察可能被 nc 僵尸进程污染。需第二轮干净实验验证
-- [ ] **Go TLS vs OpenSSL**：原结论"openssl 通、derper 不通"需在端口干净的条件下重新验证
+- [x] **socat TLS 终结可行**：实验 5 用 IP 成功返回 DERP HTML（需 `verify=0`）
+- [x] **OpenClash 不是域名 reset 的原因**：杀进程后仍 reset
+- [x] **DNS 劫持排除**：`--resolve` 强制 IP 仍 reset
+- [x] **SNI DPI 确认**：同 IP 换 SNI（test.example.com）成功，derp.wcdz.tech 被拦
 
 ### 未解决 — 按优先级排序
 
 **P0（阻塞最终目标）**：
-- [ ] **DERP 901 外部 TLS 不通**：根因待定（Anti-DDoS 已排除，可能是 OpenClash 劫持或 Go TLS 被 DPI 干扰）。当前家庭 ↔ 公司走海外 DERP 延迟 ~348-468ms，远超目标 < 20ms。
+- [ ] **换域名绕过 SNI DPI**：新建不含 VPN 特征关键词的域名，获取证书，部署 socat + derper，更新 ACL。预期解决后延迟 < 20ms。
 
 **P1（影响稳定性/安全性）**：
-- [ ] **OpenVPN 客户端证书泄露**：istoreos 的私钥和 TLS 密钥在终端输出，需��新生成
-- [ ] **Let's Encrypt 证书续期机制**：证书已续期（~2026-07-11），但 derper 不在 443 端口运行时 autocert 续期路径需确认
+- [ ] **OpenVPN 客户端证书泄露**：istoreos 的私钥和 TLS 密钥在终端输出，需重新生成
+- [ ] **derper Go TLS internal error**：derper 用 letsencrypt 模式在非 443 端口 TLS 报错，当前通过 socat 绕过，非阻塞
+- [ ] **OpenClash init 脚本状态不同步**：进程在跑但 stop 报 Already Stop，restart 无效
 
 **P2（技术债务）**：
 - [ ] **server.ovpn server 行格式异常**：`server  255.255.255.0` 缺少网段地址
 - [ ] **firewall.user 规则幂等化**
-- [ ] **bj-ali-hb2 残留服务清理**：derper + socat + nginx + kspeeder (5443/5003)
-- [ ] **bj-ali-hb2 安全扫描暴露面大**：pcap 显示大量外部 IP（5.x/23.x/45.x）扫描 443 端口
+- [ ] **bj-ali-hb2 残留服务清理**：旧 derper 容器 + nginx + kspeeder (5443/5003)
+- [ ] **bj-ali-hb2 安全扫描暴露面大**：pcap 显示大量外部 IP 扫描 443 端口
 
 ---
 
