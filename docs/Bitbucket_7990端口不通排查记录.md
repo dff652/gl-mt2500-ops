@@ -215,54 +215,86 @@ iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
 7. **Windows 防火墙排除**：关闭防火墙后仍超时
 8. **结论**：Windows OpenVPN TAP/TUN 驱动对 192.168.x.x 地址段存在兼容性问题，包在 PC 本机 VPN 驱动层被丢弃，不进入隧道。其他地址段（8.8.8.8、100.x.x.x）通过同一 VPN 正常转发
 
-### 解决方案：PC 安装 Tailscale + istoreos 子网路由
+### 进一步排查：根因定位（2026-04-13）
 
-放弃 OpenVPN 路径，PC 直接加入 Tailscale 网络，通过 istoreos 的子网路由访问 192.168.199.0/24。
+#### 关闭 GL-iNet"自定义路由规则模式"
 
-**istoreos 操作：**
+GL-iNet OpenVPN 界面开启的"自定义路由规则模式"导致服务端 `push "route 192.168.199.0 ..."` 不下发给客户端。关闭该模式后，Windows PC 恢复正常（~44ms）。
+
+但手机端 OpenVPN 客户端（OpenVPN Connect）关闭自定义模式后仍不通，需要在客户端 `.ovpn` 配置中显式添加路由。
+
+#### 服务端 push route vs 客户端 route 的区别
+
+**服务端 push route 的工作方式：**
+```
+# server.ovpn
+push "route 192.168.199.0 255.255.255.0"
+```
+服务端在 TLS 控制通道下发路由指令给客户端。客户端收到后执行两件事：
+1. 在系统路由表添加条目（`192.168.199.0/24 via VPN gateway`）
+2. 通知 TAP/TUN 驱动该网段的流量需要送进隧道
+
+**问题：** push route 受 GL-iNet"自定义路由规则模式"影响（开启时屏蔽 push），也受客户端 app 版本/实现差异影响（部分移动端 app 忽略 push route）。
+
+**客户端 route 指令的工作方式：**
+```
+# client.ovpn
+route 192.168.199.0 255.255.255.0 vpn_gateway
+```
+客户端本地执行，不依赖服务端推送。OpenVPN 客户端在建立隧道后直接配置路由表和 TAP/TUN 驱动。
+
+**关键区别：** 客户端 `route` 指令是在 OpenVPN 连接建立过程中由客户端进程直接执行，能正确配置 TAP/TUN 驱动。而手动 `route add`（Windows 命令行）只修改系统路由表，不通知 TAP/TUN 驱动，导致路由表正确但驱动不转发包。
+
+**这也解释了之前的现象：**
+- 手动 `route add` → 路由表正确（`Find-NetRoute` 显示 VPN 接口）但包不进隧道 ❌
+- 客户端 `.ovpn` 加 `route` → 路由表正确 + TAP 驱动正确配置 → 包正常进隧道 ✅
+
+### 最终解决方案
+
+**所有 OpenVPN 客户端的 `.ovpn` 配置文件添加：**
+
+```
+route 192.168.199.0 255.255.255.0 vpn_gateway
+```
+
+此方式不依赖服务端 push、不受 GL-iNet 自定义路由模式影响、所有平台（Windows/Android/iOS）通用。
+
+**验证结果（2026-04-13）：**
+
+| 客户端 | 方式 | 结果 |
+|--------|------|------|
+| Win11 PC | `.ovpn` 加 route | ✅ ping 192.168.199.126 ~44ms |
+| 手机 | `.ovpn` 加 route | ✅ ping 192.168.199.126 通 |
+
+### 备选方案：Tailscale 直连
+
+对于安装了 Tailscale 的设备，可以不走 OpenVPN，直接通过 Tailscale 子网路由访问 192.168.199.0/24。
+
+**istoreos 配置：**
 
 ```bash
-# 开启子网路由广播
 tailscale up --advertise-routes=192.168.199.0/24
 ```
 
-**Tailscale Admin 操作：**
+在 [Tailscale Admin](https://login.tailscale.com/admin/machines) 批准 istoreos 的子网路由。
 
-访问 https://login.tailscale.com/admin/machines，找到 istoreos，批准子网路由（Approve subnet routes）。
+**设备配置：** 安装 Tailscale，登录 tailnet，确认 Use Tailscale Subnets 已勾选。
 
-**PC 操作：**
-
-1. 安装 [Tailscale Windows 客户端](https://tailscale.com/download/windows)
-2. 登录同一 tailnet（dff652@）
-3. 系统托盘右键 Tailscale → 确认 **Use Tailscale Subnets** 已勾选
-
-**验证：**
-
-```cmd
-tailscale status | findstr istoreos
-tailscale ping 100.105.216.126
-ping 192.168.199.126
-```
-
-**结果（2026-04-13）：**
+**结果：**
 
 ```
-tailscale status: istoreos  active; relay "ali-bj-hb2"
-tailscale ping:   pong via DERP(ali-bj-hb2) in 15ms
-ping 192.168.199.126: 回复 时间=41ms TTL=60
+PC: ping 192.168.199.126 → 41ms (via DERP ali-bj-hb2)
 ```
 
-完整链路：`PC (Tailscale) → DERP(ali-bj-hb2, 15ms) → istoreos → 192.168.199.126`
-
-### 新旧方案对比
+### 两种方案对比
 
 | | OpenVPN 方案 | Tailscale 方案 |
 |--|--|--|
-| 链路 | PC → OpenVPN → gl-mt2500-3 → Tailscale → istoreos → 目标 | PC → Tailscale → DERP → istoreos → 目标 |
-| 跳数 | 4 跳（OpenVPN + 旁路由转发 + Tailscale + istoreos） | 2 跳（DERP 中继 + istoreos） |
-| 延迟 | 不可用（Windows TAP 驱动丢包） | ~41ms |
-| 配置 | 复杂（push route + 策略路由 + MASQUERADE） | 简单（子网路由 + 客户端勾选） |
+| 链路 | 设备 → OpenVPN → gl-mt2500-3 → Tailscale → istoreos → 目标 | 设备 → Tailscale → DERP → istoreos → 目标 |
+| 延迟 | ~44ms | ~41ms |
+| 配置 | 客户端 `.ovpn` 加 route | 安装 Tailscale + 勾选子网 |
 | 依赖 | gl-mt2500-3 旁路由必须在线 | 仅依赖 DERP 和 istoreos |
+| 适用 | 不便安装 Tailscale 的设备 | 能装 Tailscale 的设备（推荐） |
 
 ## 维护脚本
 
