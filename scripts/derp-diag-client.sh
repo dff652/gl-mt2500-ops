@@ -57,20 +57,22 @@ test_tcp() {
     info "--- $label ---"
     info "nc ${SERVER_IP} ${port} (5s timeout)"
     log ">>>>>>>>"
+    NC_TMP="/tmp/derp-diag-nc-$$"
     if command -v timeout >/dev/null 2>&1; then
         RESULT=$(echo "test" | timeout 5 nc "$SERVER_IP" "$port" 2>&1)
         rc=$?
     else
-        echo "test" | nc "$SERVER_IP" "$port" &
+        echo "test" | nc "$SERVER_IP" "$port" > "$NC_TMP" 2>&1 &
         NC_BG=$!
         sleep 3
         if kill -0 $NC_BG 2>/dev/null; then
             kill $NC_BG 2>/dev/null; wait $NC_BG 2>/dev/null
-            RESULT="(timeout)"; rc=1
+            RESULT="$(cat "$NC_TMP" 2>/dev/null) (timeout)"; rc=1
         else
             wait $NC_BG; rc=$?
-            RESULT="(nc exited with $rc)"
+            RESULT=$(cat "$NC_TMP" 2>/dev/null)
         fi
+        rm -f "$NC_TMP"
     fi
     log "$RESULT"
     log "<<<<<<<<"
@@ -258,7 +260,7 @@ cmd_killclash() {
     log ""
 
     info "=== 杀掉 OpenClash（watchdog + clash）==="
-    kill $(pgrep -f openclash_watchdog) 2>/dev/null
+    pgrep -f openclash_watchdog | xargs kill 2>/dev/null || true
     sleep 1
     killall clash 2>/dev/null
     sleep 2

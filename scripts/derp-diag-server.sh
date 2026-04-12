@@ -64,7 +64,7 @@ start_derper() {
     d_port="$1"; d_stun="$2"
     info "启动 derper (port=$d_port, stun=$d_stun)..."
     logrun docker run -d --name derper-test --network=host \
-        -e DERP_DOMAIN=derp.wcdz.tech \
+        -e DERP_DOMAIN=gw1.wcdz.tech \
         -e DERP_CERT_MODE=letsencrypt \
         -e DERP_ADDR=":${d_port}" \
         -e DERP_STUN="$d_stun" \
@@ -84,7 +84,6 @@ start_openssl() {
     port="$1"
     info "启动 openssl s_server on $port..."
     openssl s_server -accept "$port" -cert "$CERT" -key "$KEY" -www </dev/null >/dev/null 2>&1 &
-    echo $!
     sleep 1
 }
 
@@ -92,7 +91,6 @@ start_socat() {
     from_port="$1"; to_port="$2"
     info "启动 socat TLS $from_port → $to_port..."
     socat OPENSSL-LISTEN:"$from_port",cert="$CERT",key="$KEY",verify=0,reuseaddr,fork TCP:127.0.0.1:"$to_port" &
-    echo $!
     sleep 1
 }
 
@@ -166,7 +164,7 @@ cmd_setup() {
         ;;
     2)
         step "实验 2：openssl s_server 443（TLS 基线）"
-        start_openssl 443 >/dev/null
+        start_openssl 443
         assert_port_held_by 443 "openssl"
         ;;
     3)
@@ -183,14 +181,14 @@ cmd_setup() {
     4)
         step "实验 4：openssl 443 + derper 8080（隔离 Go TLS）"
         start_derper 8080 false
-        start_openssl 443 >/dev/null
+        start_openssl 443
         assert_port_held_by 443 "openssl"
         assert_port_held_by 8080 "derper\|docker"
         ;;
     5|socat)
         step "实验 5 / socat 生产配置：socat 443 → derper 8080"
         start_derper 8080 true
-        start_socat 443 8080 >/dev/null
+        start_socat 443 8080
         assert_port_held_by 443 "socat"
         assert_port_held_by 8080 "derper\|docker"
         ;;

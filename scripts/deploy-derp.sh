@@ -65,12 +65,22 @@ cmd_deploy() {
         -e DERP_STUN=true \
         -e DERP_VERIFY_CLIENTS=false \
         "$DERP_IMAGE"
-    sleep 3
 
-    if docker ps --filter "name=$DERP_CONTAINER" --filter status=running -q | grep -q .; then
-        pass "derper 容器运行中"
+    # 等待 derper 端口就绪（最多 10 秒）
+    i=0
+    while [ $i -lt 10 ]; do
+        if ss -tlnp 2>/dev/null | grep -q ':8080\s'; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if docker ps --filter "name=$DERP_CONTAINER" --filter status=running -q | grep -q . \
+       && ss -tlnp 2>/dev/null | grep -q ':8080\s'; then
+        pass "derper 容器运行中，端口 8080 就绪"
     else
-        fail "derper 启动失败"
+        fail "derper 启动失败或端口未就绪"
         docker logs "$DERP_CONTAINER" 2>&1 | tail -10
         exit 1
     fi
