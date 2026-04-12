@@ -40,7 +40,7 @@
 | 192.168.100.244 | istoreos (旁路由 VM) | Tailscale/Docker，iStoreOS 24.10.4 |
 | 192.168.199.0/24 | 公司服务器段 | 与 100 段的互通方式不明；Bitbucket (.94:7990), Ubuntu 服务器 (.126) |
 | 10.8.0.0/24 | OpenVPN 隧道 | 服务端 gl-mt2500-3 (10.8.0.1) |
-| 124.64.222.148 | 家庭公网出口 | gl-mt2500-3 的 WAN IP |
+| 124.64.222.148 | 家庭公网出口 | 主路由 (192.168.2.1) 的公网 IP，所有家庭设备共享此出口 |
 | 219.142.137.169 | 公司公网出口 | 公司 NAT 出口 |
 | 39.102.98.79 | 阿里云 bj-ali-hb2 | DERP 中继服务器公网 IP |
 
@@ -88,7 +88,11 @@ server 10.8.0.0 255.255.255.0
 100.105.216.126 istoreos  dff652@  linux  active; direct 10.8.0.5:41641
 ```
 
-istoreos 的 Tailscale 直连端点显示为 OpenVPN 隧道 IP `10.8.0.5`，而非公网 IP。同时健康检查报告：
+istoreos 的 Tailscale 直连端点显示为 OpenVPN 隧道 IP `10.8.0.5`，而非公网 IP 或 DERP 中继。
+
+> 注意：`tailscale ping 192.168.199.126` 也返回 `pong from istoreos`，这是因为 istoreos 通过 Tailscale 子网路由广播了 192.168.199.0/24 网段。192.168.199.126 本身是一台 Ubuntu 服务器，不是 istoreos。
+
+同时健康检查报告：
 
 ```
 # Health check:
@@ -383,14 +387,16 @@ nginx 也不通。但 nginx 同样使用 OpenSSL。
 
 | 测试 | derper 容器 | TLS 服务 | 外部 TLS |
 |------|------------|---------|---------|
-| openssl s_server on 443 | 已停止 | openssl | ✅ 成功 |
-| openssl s_server on 12345 | 已停止 | openssl | ✅ 成功 |
+| openssl s_server on 443 | 已停止(充分冷却) | openssl | ✅ 成功 |
+| openssl s_server on 12345 | 已停止(充分冷却) | openssl | ✅ 成功 |
 | nginx on 443 | 运行中(8080) | nginx | ❌ reset |
-| nginx on 12345 | 已停止 | nginx | ❌ reset |
+| nginx on 12345 | 已停止(刚停不久) | nginx | ❌ reset |
 | socat on 12345 | 运行中(8080) | socat | ❌ reset |
 | socat on 12345 | 运行中(8080,无STUN) | socat | ❌ reset |
 
-**规律：只要 derper 容器曾运行（即使已停止），短时间内外部 TLS 就不通。停掉所有服务等一段时间后再用 openssl s_server 测试就能通。**
+> 注意："已停止(充分冷却)" 指停掉 derper 后等待了足够时间让 Anti-DDoS 解除封禁。"已停止(刚停不久)" 指 derper 近期运行过、封禁仍在生效中。openssl s_server 测试成功的关键不是 TLS 实现差异，而是测试时封禁恰好已冷却。
+
+**规律：Anti-DDoS 封禁在 derper 相关连接风暴停止后需要一定冷却时间才解除。只有在充分冷却后，外部 TLS 才能恢复。**
 
 ### 10. 最终结论
 
