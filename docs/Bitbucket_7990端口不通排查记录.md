@@ -1,0 +1,201 @@
+# Bitbucket 7990 端口不通排查记录
+
+- 日期：2026-04-12
+- 环境：22服务器（192.168.2.22）通过 GL-MT2500 软路由访问内网 Bitbucket
+
+## 问题描述
+
+22服务器（192.168.2.22）无法 `git clone http://192.168.199.94:7990/...`，连接超时。但能 ping 通该 IP，且软路由（GL-MT2500）本机可以正常 clone。
+
+## 网络拓扑
+
+```
+22服务器 (192.168.2.22)
+    │
+    │ 默认网关
+    ▼
+GL-MT2500 软路由 (192.168.2.123, eth0)
+    │
+    │ Tailscale (100.83.20.58, tailscale0)
+    ▼
+Bitbucket Server (192.168.199.94:7990)
+```
+
+- 22服务器与 Bitbucket 不在同一子网，需要通过软路由转发
+- 软路由到 Bitbucket 的实际路径是 **Tailscale 隧道**（非直连局域网）
+
+## 排查过程
+
+### 1. 确认端口不通
+
+```bash
+# 22服务器上测试
+curl -v --connect-timeout 5 http://192.168.199.94:7990/
+# 结果：Connection timeout after 5001 ms
+```
+
+Ping 能通（ICMP 可达），但 TCP 7990 超时，说明问题在传输层。
+
+### 2. 确认软路由本机可达
+
+```bash
+# GL-MT2500 上测试
+curl -v --connect-timeout 5 http://192.168.199.94:7990/
+# 结果：HTTP/1.1 302，正常响应
+```
+
+说明路由器到 Bitbucket 的链路没有问题，问题在路由器的**流量转发**环节。
+
+### 3. 检查 iptables — 排除 NAT 劫持
+
+```bash
+iptables -t nat -L PREROUTING -n --line-numbers
+# 结果：没有 OpenClash 相关的 REDIRECT/TPROXY 规则
+```
+
+排除了 iptables NAT 劫持的可能。
+
+### 4. 定位流量劫持方式 — TUN 模式
+
+路由器上存在 `utun` 接口（198.18.0.1/30），确认 OpenClash 使用的是 **TUN 模式**，通过策略路由（ip rule）而非 iptables 劫持流量。
+
+### 5. 分析策略路由规则
+
+```bash
+ip rule list
+```
+
+关键规则：
+```
+0:    from all to 192.168.2.0/24 lookup main    # 本地子网直连
+0:    from all to 192.168.8.0/24 lookup main    # 本地子网直连
+1:    from all iif lo lookup 16800              # 路由器自身流量
+1101: not from all fwmark 0x8000/0xc000 lookup 8000  # Clash TUN
+5270: from all lookup 52                        # Tailscale
+```
+
+- 192.168.199.0/24 不在 prio 0 的直连绕行列表中
+- 转发流量（从22服务器来的）在 prio 1101 被送入 **table 8000（Clash TUN）**
+- Clash 无法正确处理这个流量，导致超时
+- 路由器自身流量走 prio 1 的 `iif lo → table 16800`，最终到达 Tailscale，所以路由器本机能通
+
+### 6. 确认实际路由路径
+
+```bash
+ip route get 192.168.199.94
+# 192.168.199.94 dev tailscale0 table 52 src 100.83.20.58
+```
+
+确认 192.168.199.94 是通过 **Tailscale（table 52）** 到达的。
+
+## 根因总结
+
+**两个问题叠加：**
+
+1. **Clash TUN 模式劫持**：OpenClash 的 TUN 模式通过策略路由将所有非本地子网的转发流量导入 Clash（table 8000），Clash 无法正确处理发往 192.168.199.94 的流量
+2. **缺少 NAT/MASQUERADE**：即使绕过 Clash 将流量送入 Tailscale（table 52），由于源 IP 是 192.168.2.22（非 Tailscale 地址），对端无法回包
+
+## 解决方案
+
+在 GL-MT2500 软路由上执行两条命令：
+
+```bash
+# 1. 添加策略路由，让 192.168.199.0/24 的流量绕过 Clash，直接走 Tailscale（table 52）
+ip rule add to 192.168.199.0/24 lookup 52 prio 100
+
+# 2. 添加 MASQUERADE，将转发流量的源 IP 伪装为路由器的 Tailscale IP（100.83.20.58）
+iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
+```
+
+## 持久化
+
+以上规则是临时的，需要在两个地方持久化以覆盖不同场景：
+
+### 场景一：软路由重启
+
+写入开机脚本 `/etc/rc.local`：
+
+```bash
+cat >> /etc/rc.local <<'EOF'
+ip rule add to 192.168.199.0/24 lookup 52 prio 100
+iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
+EOF
+```
+
+### 场景二：仅重启 OpenClash
+
+OpenClash 重启时会重建策略路由规则，可能覆盖 prio 100 的规则。`rc.local` 只在开机时执行，无法覆盖此场景。
+
+需要在 LuCI 界面 **网络 → 防火墙 → 自定义规则** 中添加：
+
+```bash
+ip rule add to 192.168.199.0/24 lookup 52 prio 100
+iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
+```
+
+防火墙自定义规则在每次防火墙重载时执行（包括 OpenClash 重启触发的重载），比 `rc.local` 更可靠。
+
+**建议两处都配置，确保万无一失。**
+
+## 后续排查与修复（2026-04-12 补充）
+
+### OpenVPN 问题
+
+通过 OpenVPN 连接软路由的 PC 无法 ping 通 192.168.199.126，原因是 `server.ovpn` 中缺少 `push route`。
+
+**已修复：**
+```bash
+echo 'push "route 192.168.199.0 255.255.255.0"' >> /etc/openvpn/ovpn/server.ovpn
+/etc/init.d/openvpn restart
+```
+
+修复后 Win11 VPN 客户端可正常访问 `http://192.168.199.94:7990/`。
+
+**待修复（低优先级）：** `server.ovpn` 中 server 行格式异常：
+```
+# 当前（缺少网段地址）：
+server  255.255.255.0
+# 应为：
+server 10.8.0.0 255.255.255.0
+```
+当前 OpenVPN 正常运行（接口 `ovpnserver` IP 为 `10.8.0.1`），GL-MT2500 的管理程序可能不完全依赖此行。固件升级后可能出问题，建议维护窗口修复。
+
+### rc.local 的 exit 0 顺序问题
+
+**已修复。** 原来两条规则写在 `exit 0` 之后，永远不会执行。已将 `exit 0` 移到末尾。
+
+修复后 `/etc/rc.local` 内容：
+```bash
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+. /lib/functions/gl_util.sh
+remount_ubifs
+
+ip rule add to 192.168.199.0/24 lookup 52 prio 100
+iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
+exit 0
+```
+
+### 规则重复叠加问题
+
+**待修复。** `firewall.user` 每次防火墙重载都会执行，当前的 `add` 写法会导致规则不断叠加。应改为幂等写法（先删再加）：
+
+```bash
+# /etc/firewall.user 中应改为：
+ip rule del to 192.168.199.0/24 lookup 52 prio 100 2>/dev/null
+ip rule add to 192.168.199.0/24 lookup 52 prio 100
+iptables -t nat -D POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE 2>/dev/null
+iptables -t nat -A POSTROUTING -d 192.168.199.0/24 -o tailscale0 -j MASQUERADE
+```
+
+同理 `/etc/rc.local` 也建议改为幂等写法。
+
+## 维护脚本
+
+已编写交互式检查修复脚本 `gl-mt2500-network-check.sh`，存放于 `/home/dff652/文档/` 目录。
+
+使用方式：`scp` 到软路由后执行，或通过 SSH：
+```bash
+ssh root@192.168.2.123 'sh -s' < /home/dff652/文档/gl-mt2500-network-check.sh
+```
